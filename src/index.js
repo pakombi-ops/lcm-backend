@@ -106,7 +106,25 @@ app.post('/api/chat', chatLimiter, async (req, res) => {
     }
   }
 });
-
+app.post('/api/chat-simple', chatLimiter, async (req, res) => {
+  const { message, conversationHistory = [] } = req.body;
+  if (!message || !message.trim()) return res.status(400).json({ error: 'Message manquant.' });
+  try {
+    const ragContext = searchBookContext(message);
+    const systemPrompt = buildSystemPrompt(ragContext);
+    const history = conversationHistory.slice(-20).map(m => ({ role: m.role, content: m.content }));
+    const response = await anthropic.messages.create({
+      model: 'claude-opus-4-5',
+      max_tokens: 600,
+      system: systemPrompt,
+      messages: [...history, { role: 'user', content: message.trim() }],
+    });
+    res.json({ response: response.content[0]?.text || '' });
+  } catch (err) {
+    console.error('Erreur:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
 // Démarrage
 app.listen(PORT, () => {
   console.log('\n🔥 Prince Johann IA — Serveur démarré');
