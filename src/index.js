@@ -54,7 +54,7 @@ app.post('/api/chat', chatLimiter, async (req, res) => {
 
   try {
     // 1. Recherche contextuelle RAG
-    const ragContext = searchBookContext(message);
+    const ragContext = await searchBookContext(message);
 
     // 2. System prompt
     const systemPrompt = buildSystemPrompt(ragContext);
@@ -110,7 +110,7 @@ app.post('/api/chat-simple', chatLimiter, async (req, res) => {
   const { message, conversationHistory = [] } = req.body;
   if (!message || !message.trim()) return res.status(400).json({ error: 'Message manquant.' });
   try {
-    const ragContext = searchBookContext(message);
+    const ragContext = await searchBookContext(message);
     const systemPrompt = buildSystemPrompt(ragContext);
     const history = conversationHistory.slice(-20).map(m => ({ role: m.role, content: m.content }));
     const response = await anthropic.messages.create({
