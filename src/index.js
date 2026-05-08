@@ -21,7 +21,13 @@ if (!process.env.ANTHROPIC_API_KEY) {
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 // Middlewares
-app.use(cors({ origin: '*' }));
+// APRÈS
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+}));
+app.options('*', cors()); // Gère les pre-flight requests mobiles
 app.use(express.json({ limit: '10mb' }));
 
 // Rate limiting
