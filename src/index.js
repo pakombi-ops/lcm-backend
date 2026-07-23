@@ -5,6 +5,7 @@ const rateLimit = require('express-rate-limit');
 const Anthropic = require('@anthropic-ai/sdk');
 const { buildSystemPrompt } = require('./systemPrompt');
 const { searchBookContext } = require('./rag');
+const entitlementsRoutes = require('../routes/entitlements');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -29,6 +30,7 @@ app.use(cors({
 }));
 app.options('*', cors()); // Gère les pre-flight requests mobiles
 app.use(express.json({ limit: '10mb' }));
+app.use('/api', entitlementsRoutes);
 
 // Rate limiting
 const chatLimiter = rateLimit({
