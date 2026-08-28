@@ -9,6 +9,9 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY
 );
 
+// Statuts Stripe considérés comme donnant accès à l'app
+const ACTIVE_LIKE_STATUSES = ['trialing', 'active'];
+
 async function syncAiQuotaPremium(supabaseUserId, isPremium) {
   await supabase
     .from('ai_quota')
@@ -33,25 +36,35 @@ router.post('/link-account', async (req, res) => {
     }
 
     const customer = customers.data[0];
+
+    // status: 'all' car Stripe ne permet pas de filtrer sur plusieurs statuts
+    // directement — on filtre côté code sur trialing + active
     const subscriptions = await stripe.subscriptions.list({
       customer: customer.id,
-      status: 'active',
-      limit: 1,
+      status: 'all',
+      limit: 10,
     });
 
-    if (!subscriptions.data.length) {
+    const relevantSub = subscriptions.data
+      .filter((s) => ACTIVE_LIKE_STATUSES.includes(s.status))
+      .sort((a, b) => b.created - a.created)[0];
+
+    if (!relevantSub) {
       return res.json({ linked: false, reason: 'no_active_subscription' });
     }
 
-    const subscription = subscriptions.data[0];
+    const trialEndsAt = relevantSub.trial_end
+      ? new Date(relevantSub.trial_end * 1000).toISOString()
+      : null;
 
     const { error } = await supabase.from('entitlements').upsert({
       supabase_user_id: supabaseUserId,
       purchase_email: email.trim().toLowerCase(),
       stripe_customer_id: customer.id,
-      stripe_subscription_id: subscription.id,
-      status: 'active',
-      plan_type: subscription.items.data[0]?.price?.nickname || null,
+      stripe_subscription_id: relevantSub.id,
+      status: relevantSub.status, // 'trialing' ou 'active', jamais forcé
+      plan_type: relevantSub.items.data[0]?.price?.nickname || null,
+      trial_ends_at: trialEndsAt,
       updated_at: new Date().toISOString(),
     }, { onConflict: 'supabase_user_id' });
 
@@ -59,7 +72,7 @@ router.post('/link-account', async (req, res) => {
 
     await syncAiQuotaPremium(supabaseUserId, true);
 
-    res.json({ linked: true });
+    res.json({ linked: true, status: relevantSub.status });
   } catch (err) {
     console.error('Erreur link-account:', err.message);
     res.status(500).json({ error: err.message });
@@ -67,8 +80,11 @@ router.post('/link-account', async (req, res) => {
 });
 
 // POST /api/update-entitlement
+// Appelé par Make.com sur les événements Stripe (checkout.session.completed,
+// customer.subscription.updated, customer.subscription.deleted,
+// invoice.payment_failed, customer.subscription.trial_will_end)
 router.post('/update-entitlement', async (req, res) => {
-  const { stripeCustomerId, status } = req.body;
+  const { stripeCustomerId, status, trialEndsAt } = req.body;
 
   if (!stripeCustomerId || !status) {
     return res.status(400).json({ error: 'stripeCustomerId et status requis.' });
@@ -81,17 +97,21 @@ router.post('/update-entitlement', async (req, res) => {
       .eq('stripe_customer_id', stripeCustomerId)
       .single();
 
-    if (fetchError) throw fetchError;
+    if (fetchError && fetchError.code !== 'PGRST116') throw fetchError;
+
+    const updatePayload = { status, updated_at: new Date().toISOString() };
+    if (trialEndsAt) updatePayload.trial_ends_at = trialEndsAt;
 
     const { error } = await supabase
       .from('entitlements')
-      .update({ status, updated_at: new Date().toISOString() })
+      .update(updatePayload)
       .eq('stripe_customer_id', stripeCustomerId);
 
     if (error) throw error;
 
     if (existing?.supabase_user_id) {
-      await syncAiQuotaPremium(existing.supabase_user_id, status === 'active');
+      const isPremium = ACTIVE_LIKE_STATUSES.includes(status);
+      await syncAiQuotaPremium(existing.supabase_user_id, isPremium);
     }
 
     res.json({ updated: true });
@@ -106,14 +126,16 @@ router.get('/entitlement-status/:supabaseUserId', async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('entitlements')
-      .select('status, plan_type')
+      .select('status, plan_type, trial_ends_at')
       .eq('supabase_user_id', req.params.supabaseUserId)
       .single();
 
     if (error && error.code !== 'PGRST116') throw error;
 
     res.json({
-      active: data?.status === 'active',
+      active: ACTIVE_LIKE_STATUSES.includes(data?.status),
+      trialActive: data?.status === 'trialing',
+      trialEndsAt: data?.trial_ends_at || null,
       planType: data?.plan_type || null,
     });
   } catch (err) {
@@ -121,6 +143,7 @@ router.get('/entitlement-status/:supabaseUserId', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
 // GET /api/programme-status?email=...
 router.get('/programme-status', async (req, res) => {
   const { email } = req.query;
@@ -131,7 +154,7 @@ router.get('/programme-status', async (req, res) => {
       .from('entitlements')
       .select('supabase_user_id')
       .eq('purchase_email', email.trim().toLowerCase())
-      .eq('status', 'active')
+      .in('status', ACTIVE_LIKE_STATUSES)
       .order('updated_at', { ascending: false })
       .limit(1);
 
@@ -166,5 +189,5 @@ router.get('/programme-status', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-module.exports = router;
 
+module.exports = router;
