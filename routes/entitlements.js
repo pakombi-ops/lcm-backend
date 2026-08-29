@@ -1,5 +1,6 @@
 const express = require('express');
 const router = express.Router();
+const crypto = require('crypto');
 const Stripe = require('stripe');
 const { createClient } = require('@supabase/supabase-js');
 
@@ -21,6 +22,34 @@ async function syncAiQuotaPremium(supabaseUserId, isPremium) {
     );
 }
 
+// Retrouve un utilisateur Supabase par email (via la fonction RPC get_user_id_by_email),
+// ou le crée avec un mot de passe aléatoire s'il n'existe pas encore.
+async function findOrCreateSupabaseUser(email, prenom) {
+  const normalizedEmail = email.trim().toLowerCase();
+
+  const { data: existingId, error: rpcError } = await supabase.rpc('get_user_id_by_email', {
+    p_email: normalizedEmail,
+  });
+
+  if (rpcError) throw rpcError;
+
+  if (existingId) {
+    return { userId: existingId, created: false };
+  }
+
+  const randomPassword = crypto.randomBytes(24).toString('hex');
+  const { data, error } = await supabase.auth.admin.createUser({
+    email: normalizedEmail,
+    password: randomPassword,
+    email_confirm: true,
+    user_metadata: { prenom: prenom || null },
+  });
+
+  if (error) throw error;
+
+  return { userId: data.user.id, created: true };
+}
+
 // POST /api/link-account
 router.post('/link-account', async (req, res) => {
   const { email, supabaseUserId } = req.body;
@@ -37,8 +66,6 @@ router.post('/link-account', async (req, res) => {
 
     const customer = customers.data[0];
 
-    // status: 'all' car Stripe ne permet pas de filtrer sur plusieurs statuts
-    // directement — on filtre côté code sur trialing + active
     const subscriptions = await stripe.subscriptions.list({
       customer: customer.id,
       status: 'all',
@@ -62,7 +89,7 @@ router.post('/link-account', async (req, res) => {
       purchase_email: email.trim().toLowerCase(),
       stripe_customer_id: customer.id,
       stripe_subscription_id: relevantSub.id,
-      status: relevantSub.status, // 'trialing' ou 'active', jamais forcé
+      status: relevantSub.status,
       plan_type: relevantSub.items.data[0]?.price?.nickname || null,
       trial_ends_at: trialEndsAt,
       updated_at: new Date().toISOString(),
@@ -79,10 +106,82 @@ router.post('/link-account', async (req, res) => {
   }
 });
 
+// POST /api/provision-account
+// Appelé par Make.com juste après un enrollment WordPress réussi (paiement site,
+// scénario 1). Crée le compte Supabase s'il n'existe pas, l'inscrit dans
+// entitlements avec le vrai statut Stripe (trialing/active), et déclenche
+// l'email de définition de mot de passe pour un nouveau compte.
+router.post('/provision-account', async (req, res) => {
+  const { email, prenom, stripeCustomerId } = req.body;
+
+  if (!email || !stripeCustomerId) {
+    return res.status(400).json({ error: 'email et stripeCustomerId requis.' });
+  }
+
+  try {
+    const normalizedEmail = email.trim().toLowerCase();
+
+    // 1. Retrouver l'abonnement réel (trialing ou active) pour ce client Stripe
+    const subscriptions = await stripe.subscriptions.list({
+      customer: stripeCustomerId,
+      status: 'all',
+      limit: 10,
+    });
+
+    const relevantSub = subscriptions.data
+      .filter((s) => ACTIVE_LIKE_STATUSES.includes(s.status))
+      .sort((a, b) => b.created - a.created)[0];
+
+    // 2. Compte Supabase — retrouver ou créer
+    const { userId, created } = await findOrCreateSupabaseUser(normalizedEmail, prenom);
+
+    // 3. Profil (upsert idempotent, ne dépend d'aucun trigger existant ou non)
+    await supabase.from('profiles').upsert({
+      id: userId,
+      email: normalizedEmail,
+      prenom: prenom || null,
+      updated_at: new Date().toISOString(),
+    }, { onConflict: 'id' });
+
+    // 4. Entitlement — création immédiate, ne dépend plus d'une connexion app
+    const trialEndsAt = relevantSub?.trial_end
+      ? new Date(relevantSub.trial_end * 1000).toISOString()
+      : null;
+
+    await supabase.from('entitlements').upsert({
+      supabase_user_id: userId,
+      purchase_email: normalizedEmail,
+      stripe_customer_id: stripeCustomerId,
+      stripe_subscription_id: relevantSub?.id || null,
+      status: relevantSub?.status || 'inactive',
+      plan_type: relevantSub?.items?.data?.[0]?.price?.nickname || null,
+      trial_ends_at: trialEndsAt,
+      updated_at: new Date().toISOString(),
+    }, { onConflict: 'supabase_user_id' });
+
+    // 5. Email de définition de mot de passe — uniquement pour un compte tout neuf
+    if (created) {
+      const { error: resetErr } = await supabase.auth.resetPasswordForEmail(normalizedEmail);
+      if (resetErr) {
+        console.error('Erreur resetPasswordForEmail:', resetErr.message);
+      }
+    }
+
+    await syncAiQuotaPremium(userId, ACTIVE_LIKE_STATUSES.includes(relevantSub?.status));
+
+    res.json({
+      success: true,
+      userId,
+      createdNewUser: created,
+      status: relevantSub?.status || null,
+    });
+  } catch (err) {
+    console.error('Erreur provision-account:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // POST /api/update-entitlement
-// Appelé par Make.com sur les événements Stripe (checkout.session.completed,
-// customer.subscription.updated, customer.subscription.deleted,
-// invoice.payment_failed, customer.subscription.trial_will_end)
 router.post('/update-entitlement', async (req, res) => {
   const { stripeCustomerId, status, trialEndsAt } = req.body;
 
