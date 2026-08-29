@@ -159,13 +159,10 @@ router.post('/provision-account', async (req, res) => {
       updated_at: new Date().toISOString(),
     }, { onConflict: 'supabase_user_id' });
 
-    // 5. Email de définition de mot de passe — uniquement pour un compte tout neuf
-    if (created) {
-      const { error: resetErr } = await supabase.auth.resetPasswordForEmail(normalizedEmail);
-      if (resetErr) {
-        console.error('Erreur resetPasswordForEmail:', resetErr.message);
-      }
-    }
+    // Note : aucun email de définition de mot de passe n'est déclenché ici.
+    // L'utilisateur génère son propre code via l'écran "Mot de passe oublié"
+    // de l'app — un appel serveur ici créerait un code redondant et invalidé
+    // dès que l'utilisateur en redemande un depuis l'app.
 
     await syncAiQuotaPremium(userId, ACTIVE_LIKE_STATUSES.includes(relevantSub?.status));
 
