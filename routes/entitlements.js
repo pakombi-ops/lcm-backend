@@ -112,7 +112,7 @@ router.post('/link-account', async (req, res) => {
 // entitlements avec le vrai statut Stripe (trialing/active), et déclenche
 // l'email de définition de mot de passe pour un nouveau compte.
 router.post('/provision-account', async (req, res) => {
-  const { email, prenom, stripeCustomerId } = req.body;
+  const { email, prenom, stripeCustomerId, supabaseUserId } = req.body;
 
   if (!email || !stripeCustomerId) {
     return res.status(400).json({ error: 'email et stripeCustomerId requis.' });
@@ -132,8 +132,28 @@ router.post('/provision-account', async (req, res) => {
       .filter((s) => ACTIVE_LIKE_STATUSES.includes(s.status))
       .sort((a, b) => b.created - a.created)[0];
 
-    // 2. Compte Supabase — retrouver ou créer
-    const { userId, created } = await findOrCreateSupabaseUser(normalizedEmail, prenom);
+    // 2. Compte Supabase — retrouver ou créer.
+    // Si un supabaseUserId est fourni (tunnel app), on ne lui fait confiance
+    // QUE s'il correspond réellement à l'email ayant payé — sinon quelqu'un
+    // pourrait payer avec son propre compte tout en indiquant l'ID d'un
+    // autre utilisateur pour lui voler l'accès premium.
+    let userId = null;
+    let created = false;
+
+    if (supabaseUserId) {
+      const { data: existingUserData, error: getUserError } = await supabase.auth.admin.getUserById(supabaseUserId);
+      if (!getUserError && existingUserData?.user?.email?.toLowerCase() === normalizedEmail) {
+        userId = supabaseUserId;
+      }
+      // Si ça ne correspond pas, on ignore silencieusement l'indice et on
+      // retombe sur la recherche/création par email ci-dessous.
+    }
+
+    if (!userId) {
+      const result = await findOrCreateSupabaseUser(normalizedEmail, prenom);
+      userId = result.userId;
+      created = result.created;
+    }
 
     // 3. Profil (upsert idempotent, ne dépend d'aucun trigger existant ou non)
     await supabase.from('profiles').upsert({
