@@ -13,6 +13,50 @@ const supabase = createClient(
 // Statuts Stripe considérés comme donnant accès à l'app
 const ACTIVE_LIKE_STATUSES = ['trialing', 'active'];
 
+// La Transmission : identifiants des prix Stripe (séparés par des virgules,
+// variable d'environnement Railway TRANSMISSION_PRICE_IDS). Les abonnements
+// de paiement en 3 fois de La Transmission ne doivent JAMAIS être traités
+// comme un abonnement à l'app : l'accès Transmission est géré par une date
+// de fin (access_expires_at), pas par le statut de l'abonnement.
+const TRANSMISSION_PRICE_IDS = (process.env.TRANSMISSION_PRICE_IDS || '')
+  .split(',')
+  .map((id) => id.trim())
+  .filter(Boolean);
+
+const TRANSMISSION_PLAN_TYPES = ['transmission_groupe', 'transmission_1a1'];
+
+function isTransmissionSub(sub) {
+  return (sub?.items?.data || []).some((item) =>
+    TRANSMISSION_PRICE_IDS.includes(item?.price?.id)
+  );
+}
+
+// Abonnement app le plus récent (actif ou en essai), hors La Transmission.
+function pickRelevantAppSub(subscriptions) {
+  return subscriptions
+    .filter((s) => ACTIVE_LIKE_STATUSES.includes(s.status) && !isTransmissionSub(s))
+    .sort((a, b) => b.created - a.created)[0];
+}
+
+// Vrai si l'utilisateur a encore un accès à durée fixe en cours.
+function hasRunningFixedTermAccess(entitlement) {
+  return Boolean(
+    entitlement?.access_expires_at &&
+    new Date(entitlement.access_expires_at) > new Date() &&
+    ACTIVE_LIKE_STATUSES.includes(entitlement.status)
+  );
+}
+
+async function getEntitlementByUserId(supabaseUserId) {
+  const { data, error } = await supabase
+    .from('entitlements')
+    .select('status, access_expires_at')
+    .eq('supabase_user_id', supabaseUserId)
+    .maybeSingle();
+  if (error) throw error;
+  return data;
+}
+
 async function syncAiQuotaPremium(supabaseUserId, isPremium) {
   await supabase
     .from('ai_quota')
@@ -72,9 +116,7 @@ router.post('/link-account', async (req, res) => {
       limit: 10,
     });
 
-    const relevantSub = subscriptions.data
-      .filter((s) => ACTIVE_LIKE_STATUSES.includes(s.status))
-      .sort((a, b) => b.created - a.created)[0];
+    const relevantSub = pickRelevantAppSub(subscriptions.data);
 
     if (!relevantSub) {
       return res.json({ linked: false, reason: 'no_active_subscription' });
@@ -84,6 +126,7 @@ router.post('/link-account', async (req, res) => {
       ? new Date(relevantSub.trial_end * 1000).toISOString()
       : null;
 
+    // Un vrai abonnement app prend le relais : plus de date de fin.
     const { error } = await supabase.from('entitlements').upsert({
       supabase_user_id: supabaseUserId,
       purchase_email: email.trim().toLowerCase(),
@@ -92,6 +135,7 @@ router.post('/link-account', async (req, res) => {
       status: relevantSub.status,
       plan_type: relevantSub.items.data[0]?.price?.nickname || null,
       trial_ends_at: trialEndsAt,
+      access_expires_at: null,
       updated_at: new Date().toISOString(),
     }, { onConflict: 'supabase_user_id' });
 
@@ -121,16 +165,14 @@ router.post('/provision-account', async (req, res) => {
   try {
     const normalizedEmail = email.trim().toLowerCase();
 
-    // 1. Retrouver l'abonnement réel (trialing ou active) pour ce client Stripe
+    // 1. Retrouver l'abonnement app réel (trialing ou active), hors La Transmission
     const subscriptions = await stripe.subscriptions.list({
       customer: stripeCustomerId,
       status: 'all',
       limit: 10,
     });
 
-    const relevantSub = subscriptions.data
-      .filter((s) => ACTIVE_LIKE_STATUSES.includes(s.status))
-      .sort((a, b) => b.created - a.created)[0];
+    const relevantSub = pickRelevantAppSub(subscriptions.data);
 
     // 2. Compte Supabase — retrouver ou créer.
     // Si un supabaseUserId est fourni (tunnel app), on ne lui fait confiance
@@ -163,37 +205,132 @@ router.post('/provision-account', async (req, res) => {
       updated_at: new Date().toISOString(),
     }, { onConflict: 'id' });
 
-    // 4. Entitlement — création immédiate, ne dépend plus d'une connexion app
-    const trialEndsAt = relevantSub?.trial_end
-      ? new Date(relevantSub.trial_end * 1000).toISOString()
-      : null;
+    // 4. Entitlement.
+    // Garde-fou : sans abonnement app, on ne rétrograde JAMAIS un accès à durée
+    // fixe encore en cours (ex. membre de La Transmission qui achète le livre).
+    const existing = await getEntitlementByUserId(userId);
+    const keepFixedTermAccess = !relevantSub && hasRunningFixedTermAccess(existing);
 
-    await supabase.from('entitlements').upsert({
-      supabase_user_id: userId,
-      purchase_email: normalizedEmail,
-      stripe_customer_id: stripeCustomerId,
-      stripe_subscription_id: relevantSub?.id || null,
-      status: relevantSub?.status || 'inactive',
-      plan_type: relevantSub?.items?.data?.[0]?.price?.nickname || null,
-      trial_ends_at: trialEndsAt,
-      updated_at: new Date().toISOString(),
-    }, { onConflict: 'supabase_user_id' });
+    if (!keepFixedTermAccess) {
+      const trialEndsAt = relevantSub?.trial_end
+        ? new Date(relevantSub.trial_end * 1000).toISOString()
+        : null;
+
+      const entitlementRow = {
+        supabase_user_id: userId,
+        purchase_email: normalizedEmail,
+        stripe_customer_id: stripeCustomerId,
+        stripe_subscription_id: relevantSub?.id || null,
+        status: relevantSub?.status || 'inactive',
+        plan_type: relevantSub?.items?.data?.[0]?.price?.nickname || null,
+        trial_ends_at: trialEndsAt,
+        updated_at: new Date().toISOString(),
+      };
+      // Un vrai abonnement app prend le relais : plus de date de fin.
+      if (relevantSub) entitlementRow.access_expires_at = null;
+
+      await supabase.from('entitlements').upsert(entitlementRow, { onConflict: 'supabase_user_id' });
+
+      await syncAiQuotaPremium(userId, ACTIVE_LIKE_STATUSES.includes(relevantSub?.status));
+    }
 
     // Note : aucun email de définition de mot de passe n'est déclenché ici.
     // L'utilisateur génère son propre code via l'écran "Mot de passe oublié"
     // de l'app — un appel serveur ici créerait un code redondant et invalidé
     // dès que l'utilisateur en redemande un depuis l'app.
 
-    await syncAiQuotaPremium(userId, ACTIVE_LIKE_STATUSES.includes(relevantSub?.status));
+    res.json({
+      success: true,
+      userId,
+      createdNewUser: created,
+      status: keepFixedTermAccess ? existing.status : (relevantSub?.status || null),
+      fixedTermAccessKept: keepFixedTermAccess,
+    });
+  } catch (err) {
+    console.error('Erreur provision-account:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/grant-access
+// La Transmission : accorde un accès premium à durée fixe, indépendant de tout
+// abonnement Stripe. Appelé UNIQUEMENT par Make.com (route Transmission), protégé
+// par un secret partagé (variable Railway MAKE_SHARED_SECRET, en-tête x-make-secret).
+// Corps JSON : { email, prenom, planType, expiresAt, stripeCustomerId? }
+router.post('/grant-access', async (req, res) => {
+  const expectedSecret = process.env.MAKE_SHARED_SECRET;
+  const receivedSecret = req.get('x-make-secret') || '';
+
+  if (
+    !expectedSecret ||
+    receivedSecret.length !== expectedSecret.length ||
+    !crypto.timingSafeEqual(Buffer.from(receivedSecret), Buffer.from(expectedSecret))
+  ) {
+    return res.status(401).json({ error: 'Non autorisé.' });
+  }
+
+  const { email, prenom, planType, expiresAt, stripeCustomerId } = req.body;
+
+  if (!email || !planType || !expiresAt) {
+    return res.status(400).json({ error: 'email, planType et expiresAt requis.' });
+  }
+
+  if (!TRANSMISSION_PLAN_TYPES.includes(planType)) {
+    return res.status(400).json({ error: `planType invalide (attendu : ${TRANSMISSION_PLAN_TYPES.join(' ou ')}).` });
+  }
+
+  const expiry = new Date(expiresAt);
+  const now = new Date();
+  const maxExpiry = new Date(now);
+  maxExpiry.setMonth(maxExpiry.getMonth() + 24);
+
+  if (Number.isNaN(expiry.getTime()) || expiry <= now || expiry > maxExpiry) {
+    return res.status(400).json({ error: 'expiresAt doit être une date future, à moins de 24 mois.' });
+  }
+
+  try {
+    const normalizedEmail = email.trim().toLowerCase();
+    const { userId, created } = await findOrCreateSupabaseUser(normalizedEmail, prenom);
+
+    await supabase.from('profiles').upsert({
+      id: userId,
+      email: normalizedEmail,
+      prenom: prenom || null,
+      updated_at: new Date().toISOString(),
+    }, { onConflict: 'id' });
+
+    // Si un accès à durée fixe plus long existe déjà, on garde la date la plus lointaine.
+    const existing = await getEntitlementByUserId(userId);
+    let finalExpiry = expiry;
+    if (existing?.access_expires_at && new Date(existing.access_expires_at) > finalExpiry) {
+      finalExpiry = new Date(existing.access_expires_at);
+    }
+
+    const row = {
+      supabase_user_id: userId,
+      purchase_email: normalizedEmail,
+      status: 'active',
+      plan_type: planType,
+      trial_ends_at: null,
+      access_expires_at: finalExpiry.toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    if (stripeCustomerId) row.stripe_customer_id = stripeCustomerId;
+
+    const { error } = await supabase.from('entitlements').upsert(row, { onConflict: 'supabase_user_id' });
+    if (error) throw error;
+
+    await syncAiQuotaPremium(userId, true);
 
     res.json({
       success: true,
       userId,
       createdNewUser: created,
-      status: relevantSub?.status || null,
+      planType,
+      accessExpiresAt: finalExpiry.toISOString(),
     });
   } catch (err) {
-    console.error('Erreur provision-account:', err.message);
+    console.error('Erreur grant-access:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -209,11 +346,17 @@ router.post('/update-entitlement', async (req, res) => {
   try {
     const { data: existing, error: fetchError } = await supabase
       .from('entitlements')
-      .select('supabase_user_id')
+      .select('supabase_user_id, status, access_expires_at')
       .eq('stripe_customer_id', stripeCustomerId)
       .single();
 
     if (fetchError && fetchError.code !== 'PGRST116') throw fetchError;
+
+    // Garde-fou : un événement d'abonnement ne retire jamais un accès à durée
+    // fixe encore en cours (ex. fin du paiement en 3 fois de La Transmission).
+    if (!ACTIVE_LIKE_STATUSES.includes(status) && hasRunningFixedTermAccess(existing)) {
+      return res.json({ updated: false, reason: 'fixed_term_access_running' });
+    }
 
     const updatePayload = { status, updated_at: new Date().toISOString() };
     if (trialEndsAt) updatePayload.trial_ends_at = trialEndsAt;
@@ -242,7 +385,7 @@ router.get('/entitlement-status/:supabaseUserId', async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('entitlements')
-      .select('status, plan_type, trial_ends_at')
+      .select('status, plan_type, trial_ends_at, access_expires_at')
       .eq('supabase_user_id', req.params.supabaseUserId)
       .single();
 
@@ -253,6 +396,7 @@ router.get('/entitlement-status/:supabaseUserId', async (req, res) => {
       trialActive: data?.status === 'trialing',
       trialEndsAt: data?.trial_ends_at || null,
       planType: data?.plan_type || null,
+      accessExpiresAt: data?.access_expires_at || null,
     });
   } catch (err) {
     console.error('Erreur entitlement-status:', err.message);

@@ -1,0 +1,49 @@
+pg_get_functiondef
+"CREATE OR REPLACE FUNCTION public.recompute_pillar_priority(p_user_id uuid)
+ RETURNS void
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public', 'pg_temp'
+AS $function$
+declare
+  v_diagnostic_id uuid;
+  v_scores jsonb;
+begin
+  select id, scores into v_diagnostic_id, v_scores
+  from public.diagnostic_results
+  where user_id = p_user_id
+  order by created_at desc
+  limit 1;
+
+  if v_diagnostic_id is null then
+    return;
+  end if;
+
+  update public.user_pillar_priority
+  set is_active = false
+  where user_id = p_user_id and is_active = true;
+
+  insert into public.user_pillar_priority
+    (user_id, pillar_id, pillar_slug, score, rank, diagnostic_result_id)
+  select
+    p_user_id,
+    pillar_map.pillar_id,
+    pillar_map.pillar_slug,
+    (v_scores ->> pillar_map.pillar_id::text)::numeric as score,
+    row_number() over (
+      order by (v_scores ->> pillar_map.pillar_id::text)::numeric asc
+    )::smallint as rank,
+    v_diagnostic_id
+  from (
+    values
+      (1, 'force-physique'), (2, 'discipline'), (3, 'leadership'),
+      (4, 'vulnerabilite-strategique'), (5, 'but'), (6, 'honneur'),
+      (7, 'presence'), (8, 'stoicisme'), (9, 'generosite'),
+      (10, 'courage'), (11, 'authenticite'), (12, 'heritage')
+  ) as pillar_map(pillar_id, pillar_slug)
+  where v_scores ? pillar_map.pillar_id::text
+  order by score asc
+  limit 3;
+end;
+$function$
+"
