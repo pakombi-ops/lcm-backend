@@ -3,6 +3,7 @@ const router = express.Router();
 const crypto = require('crypto');
 const Stripe = require('stripe');
 const { createClient } = require('@supabase/supabase-js');
+const { requireUser, requireMakeSecret } = require('../src/auth');
 
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 const supabase = createClient(
@@ -95,11 +96,25 @@ async function findOrCreateSupabaseUser(email, prenom) {
 }
 
 // POST /api/link-account
-router.post('/link-account', async (req, res) => {
-  const { email, supabaseUserId } = req.body;
+router.post('/link-account', requireUser, async (req, res) => {
+  const { email } = req.body;
+  // L'identité vient du jeton, jamais du corps de la requête.
+  const supabaseUserId = req.user.id;
 
-  if (!email || !supabaseUserId) {
-    return res.status(400).json({ error: 'email et supabaseUserId requis.' });
+  if (!email) {
+    return res.status(400).json({ error: 'email requis.' });
+  }
+
+  // Sans preuve de possession de l'email d'achat (code de confirmation, pas encore
+  // construit), on ne relie que si l'email du compte connecté est le même.
+  // Sinon, n'importe qui connaissant l'email d'un abonné pourrait prendre son accès.
+  // L'email du compte doit aussi être confirmé par Supabase (email_confirmed_at),
+  // sinon quelqu'un peut créer un compte avec l'email d'un autre sans le posséder.
+  if (!req.user.email_confirmed_at) {
+    return res.json({ linked: false, reason: 'email_not_verified' });
+  }
+  if ((req.user.email || '').trim().toLowerCase() !== email.trim().toLowerCase()) {
+    return res.json({ linked: false, reason: 'email_mismatch' });
   }
 
   try {
@@ -155,7 +170,7 @@ router.post('/link-account', async (req, res) => {
 // scénario 1). Crée le compte Supabase s'il n'existe pas, l'inscrit dans
 // entitlements avec le vrai statut Stripe (trialing/active), et déclenche
 // l'email de définition de mot de passe pour un nouveau compte.
-router.post('/provision-account', async (req, res) => {
+router.post('/provision-account', requireMakeSecret, async (req, res) => {
   const { email, prenom, stripeCustomerId, supabaseUserId } = req.body;
 
   if (!email || !stripeCustomerId) {
@@ -336,7 +351,7 @@ router.post('/grant-access', async (req, res) => {
 });
 
 // POST /api/update-entitlement
-router.post('/update-entitlement', async (req, res) => {
+router.post('/update-entitlement', requireMakeSecret, async (req, res) => {
   const { stripeCustomerId, status, trialEndsAt } = req.body;
 
   if (!stripeCustomerId || !status) {
@@ -381,7 +396,10 @@ router.post('/update-entitlement', async (req, res) => {
 });
 
 // GET /api/entitlement-status/:supabaseUserId
-router.get('/entitlement-status/:supabaseUserId', async (req, res) => {
+router.get('/entitlement-status/:supabaseUserId', requireUser, async (req, res) => {
+  if (req.params.supabaseUserId !== req.user.id) {
+    return res.status(403).json({ error: 'Accès refusé.' });
+  }
   try {
     const { data, error } = await supabase
       .from('entitlements')
@@ -405,7 +423,7 @@ router.get('/entitlement-status/:supabaseUserId', async (req, res) => {
 });
 
 // GET /api/programme-status?email=...
-router.get('/programme-status', async (req, res) => {
+router.get('/programme-status', requireMakeSecret, async (req, res) => {
   const { email } = req.query;
   if (!email) return res.status(400).json({ error: 'email requis.' });
 
