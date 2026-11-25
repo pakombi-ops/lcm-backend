@@ -26,6 +26,28 @@ const TRANSMISSION_PRICE_IDS = (process.env.TRANSMISSION_PRICE_IDS || '')
 
 const TRANSMISSION_PLAN_TYPES = ['transmission_groupe', 'transmission_1a1'];
 
+// Liste fermée des statuts d'abonnement Stripe acceptés par /update-entitlement
+// (https://docs.stripe.com/api/subscriptions/object#subscription_object-status).
+const STRIPE_SUBSCRIPTION_STATUSES = [
+  'incomplete',
+  'incomplete_expired',
+  'trialing',
+  'active',
+  'past_due',
+  'canceled',
+  'unpaid',
+  'paused',
+];
+
+// Comparaison d'emails sans tenir compte des majuscules ni des espaces
+// (en début, en fin, ou à l'intérieur : un email valide n'en contient pas).
+// Renvoie null pour une valeur absente ou non textuelle : null ne correspond à rien.
+function normalizeEmail(value) {
+  if (typeof value !== 'string') return null;
+  const normalized = value.replace(/\s+/g, '').toLowerCase();
+  return normalized || null;
+}
+
 function isTransmissionSub(sub) {
   return (sub?.items?.data || []).some((item) =>
     TRANSMISSION_PRICE_IDS.includes(item?.price?.id)
@@ -174,12 +196,31 @@ router.post('/link-account', requireUser, async (req, res) => {
 router.post('/provision-account', requireMakeSecret, async (req, res) => {
   const { email, prenom, stripeCustomerId, supabaseUserId } = req.body;
 
-  if (!email || !stripeCustomerId) {
+  if (typeof email !== 'string' || !email.trim() || typeof stripeCustomerId !== 'string' || !stripeCustomerId) {
     return res.status(400).json({ error: 'email et stripeCustomerId requis.' });
   }
 
   try {
-    const normalizedEmail = email.trim().toLowerCase();
+    const normalizedEmail = normalizeEmail(email);
+
+    // 0. Le client Stripe doit exister et avoir payé avec CET email. Défense en
+    //    profondeur : même avec le secret Make, une erreur de correspondance dans
+    //    un scénario (ou une fuite du secret) ne doit pas permettre de rattacher
+    //    l'abonnement d'un autre client, ni de rétrograder le compte d'une victime.
+    let customer;
+    try {
+      customer = await stripe.customers.retrieve(stripeCustomerId);
+    } catch (stripeErr) {
+      if (stripeErr && stripeErr.code === 'resource_missing') {
+        return res.status(400).json({ error: 'Client Stripe introuvable.', code: 'unknown_customer' });
+      }
+      throw stripeErr;
+    }
+    const customerEmail = customer && !customer.deleted ? normalizeEmail(customer.email) : null;
+    if (!customerEmail || customerEmail !== normalizedEmail) {
+      console.warn(`[provision-account] Email différent de celui du client Stripe ${stripeCustomerId} : refusé.`);
+      return res.status(403).json({ error: "L'email ne correspond pas au client Stripe.", code: 'email_mismatch' });
+    }
 
     // 1. Retrouver l'abonnement app réel (trialing ou active), hors La Transmission
     const subscriptions = await stripe.subscriptions.list({
@@ -200,7 +241,7 @@ router.post('/provision-account', requireMakeSecret, async (req, res) => {
 
     if (supabaseUserId) {
       const { data: existingUserData, error: getUserError } = await supabase.auth.admin.getUserById(supabaseUserId);
-      if (!getUserError && existingUserData?.user?.email?.toLowerCase() === normalizedEmail) {
+      if (!getUserError && normalizeEmail(existingUserData?.user?.email) === normalizedEmail) {
         userId = supabaseUserId;
       }
       // Si ça ne correspond pas, on ignore silencieusement l'indice et on
@@ -355,8 +396,15 @@ router.post('/grant-access', async (req, res) => {
 router.post('/update-entitlement', requireMakeSecret, async (req, res) => {
   const { stripeCustomerId, status, trialEndsAt } = req.body;
 
-  if (!stripeCustomerId || !status) {
+  if (typeof stripeCustomerId !== 'string' || !stripeCustomerId || !status) {
     return res.status(400).json({ error: 'stripeCustomerId et status requis.' });
+  }
+  if (!STRIPE_SUBSCRIPTION_STATUSES.includes(status)) {
+    console.warn(`[update-entitlement] Statut refusé : ${JSON.stringify(status).slice(0, 40)}`);
+    return res.status(400).json({
+      error: `status invalide (attendu : ${STRIPE_SUBSCRIPTION_STATUSES.join(', ')}).`,
+      code: 'invalid_status',
+    });
   }
 
   try {
@@ -470,3 +518,5 @@ router.get('/programme-status', requireMakeSecret, async (req, res) => {
 });
 
 module.exports = router;
+module.exports.STRIPE_SUBSCRIPTION_STATUSES = STRIPE_SUBSCRIPTION_STATUSES;
+module.exports.normalizeEmail = normalizeEmail;
