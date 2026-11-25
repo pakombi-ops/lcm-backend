@@ -8,6 +8,7 @@ const { searchBookContext } = require('./rag');
 const { requireUser } = require('./auth');
 const { detectCrisis, CRISIS_REPLY } = require('./safety');
 const { createQuota } = require('./quota');
+const { validateChatBody } = require('./chatValidation');
 const { createClient } = require('@supabase/supabase-js');
 const entitlementsRoutes = require('../routes/entitlements');
 
@@ -49,15 +50,33 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
 app.options('*', cors()); // Gère les pre-flight requests mobiles
-app.use(express.json({ limit: '10mb' }));
+// 64 Ko suffisent largement : message ≤ 2000 caractères + 20 messages d'historique.
+app.use(express.json({ limit: '64kb' }));
 app.use('/api', entitlementsRoutes);
 
 // Rate limiting
+// 1) par IP, AVANT la vérification du jeton : limite aussi les appels sans compte.
 const chatLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: Number(process.env.CHAT_RATE_MAX) || 30,
   message: { error: 'Trop de messages. Attends une minute.' },
 });
+// 2) par compte (après requireUser) : un compte ne peut pas contourner la limite en changeant d'IP.
+//    Compteurs en mémoire : remis à zéro à chaque redémarrage (une seule instance Railway).
+const byUser = (req) => req.user.id;
+const userMinuteLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: Number(process.env.CHAT_USER_RATE_MAX) || 8,
+  keyGenerator: byUser,
+  message: { error: 'Trop de messages. Attends une minute.' },
+});
+const userDailyLimiter = rateLimit({
+  windowMs: 24 * 60 * 60 * 1000,
+  max: Number(process.env.CHAT_USER_DAILY_MAX) || 150,
+  keyGenerator: byUser,
+  message: { error: 'daily_limit', message: 'Limite quotidienne atteinte. Reviens demain.' },
+});
+const chatGuards = [chatLimiter, requireUser, userMinuteLimiter, userDailyLimiter];
 
 // GET /api/health
 app.get('/api/health', (req, res) => {
@@ -69,16 +88,10 @@ app.get('/api/health', (req, res) => {
 });
 
 // POST /api/chat
-app.post('/api/chat', requireUser, chatLimiter, async (req, res) => {
-  const { message, conversationHistory = [] } = req.body;
-
-  if (!message || !message.trim()) {
-    return res.status(400).json({ error: 'Message manquant.' });
-  }
-
-  if (message.length > 2000) {
-    return res.status(400).json({ error: 'Message trop long.' });
-  }
+app.post('/api/chat', chatGuards, async (req, res) => {
+  const input = validateChatBody(req.body);
+  if (!input.ok) return res.status(400).json({ error: input.error });
+  const { message, history } = input;
 
   if (detectCrisis(message)) {
     return res.json({ response: CRISIS_REPLY, safety: true });
@@ -94,10 +107,7 @@ app.post('/api/chat', requireUser, chatLimiter, async (req, res) => {
     // 2. System prompt
     const systemPrompt = buildSystemPrompt(ragContext);
 
-    // 3. Historique (max 20 messages)
-    const history = conversationHistory
-      .slice(-20)
-      .map(m => ({ role: m.role, content: m.content }));
+    // 3. Historique : déjà validé et réduit à 20 messages (validateChatBody)
 
     // 4. Config SSE streaming
     res.setHeader('Content-Type', 'text/event-stream');
@@ -113,7 +123,7 @@ app.post('/api/chat', requireUser, chatLimiter, async (req, res) => {
       system: systemPrompt,
       messages: [
         ...history,
-        { role: 'user', content: message.trim() },
+        { role: 'user', content: message },
       ],
       stream: true,
     });
@@ -142,22 +152,21 @@ app.post('/api/chat', requireUser, chatLimiter, async (req, res) => {
     }
   }
 });
-app.post('/api/chat-simple', requireUser, chatLimiter, async (req, res) => {
-  const { message, conversationHistory = [] } = req.body;
-  if (!message || !message.trim()) return res.status(400).json({ error: 'Message manquant.' });
-  if (message.length > 2000) return res.status(400).json({ error: 'Message trop long.' });
+app.post('/api/chat-simple', chatGuards, async (req, res) => {
+  const input = validateChatBody(req.body);
+  if (!input.ok) return res.status(400).json({ error: input.error });
+  const { message, history } = input;
   if (detectCrisis(message)) return res.json({ response: CRISIS_REPLY, safety: true });
   const reservation = await reserveOrReply(req, res);
   if (!reservation) return;
   try {
     const ragContext = await searchBookContext(message);
     const systemPrompt = buildSystemPrompt(ragContext);
-    const history = conversationHistory.slice(-20).map(m => ({ role: m.role, content: m.content }));
     const response = await anthropic.messages.create({
       model: 'claude-opus-4-5',
       max_tokens: 600,
       system: systemPrompt,
-      messages: [...history, { role: 'user', content: message.trim() }],
+      messages: [...history, { role: 'user', content: message }],
     });
     res.json({
       response: response.content[0]?.text || '',
@@ -201,11 +210,31 @@ app.delete('/api/account', requireUser, async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log('\n🔥 Prince Johann IA — Serveur démarré');
-  console.log(`📡 http://localhost:${PORT}`);
-  console.log(`🤖 Modèle : claude-opus-4-5`);
-  console.log(`🔑 Clé Anthropic : ✅ configurée`);
-  console.log(`📚 RAG : actif (mode mots-clés)`);
-  console.log('\n✅ Prêt à recevoir des messages.\n');
+// Erreurs de lecture du corps (JSON invalide, corps > 64 Ko) : réponse JSON courte,
+// sans la trace de pile qu'affiche le gestionnaire par défaut d'Express.
+app.use((err, req, res, next) => {
+  if (res.headersSent) return next(err);
+  if (err.type === 'entity.too.large') return res.status(413).json({ error: 'payload_too_large' });
+  if (err.type === 'entity.parse.failed') return res.status(400).json({ error: 'invalid_json' });
+  console.error('Erreur non gérée:', err.message);
+  res.status(500).json({ error: 'server_error' });
 });
+
+// Filet de sécurité : une promesse rejetée dans une route async (Express 4 ne les
+// intercepte pas) ne doit plus arrêter tout le serveur. On journalise et on continue.
+process.on('unhandledRejection', (reason) => {
+  console.error('Promesse rejetée non gérée:', reason && reason.message ? reason.message : reason);
+});
+
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log('\n🔥 Prince Johann IA — Serveur démarré');
+    console.log(`📡 http://localhost:${PORT}`);
+    console.log(`🤖 Modèle : claude-opus-4-5`);
+    console.log(`🔑 Clé Anthropic : ✅ configurée`);
+    console.log(`📚 RAG : actif (mode mots-clés)`);
+    console.log('\n✅ Prêt à recevoir des messages.\n');
+  });
+}
+
+module.exports = app;

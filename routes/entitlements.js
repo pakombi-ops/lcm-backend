@@ -101,7 +101,8 @@ router.post('/link-account', requireUser, async (req, res) => {
   // L'identité vient du jeton, jamais du corps de la requête.
   const supabaseUserId = req.user.id;
 
-  if (!email) {
+  // typeof : un email non textuel (ex. 42) faisait planter le serveur sur email.trim().
+  if (typeof email !== 'string' || !email.trim()) {
     return res.status(400).json({ error: 'email requis.' });
   }
 
