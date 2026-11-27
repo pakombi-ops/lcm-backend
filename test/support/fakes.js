@@ -127,6 +127,16 @@ const fakeStripe = {
       stripeState.calls.push({ fn: 'subscriptions.list', params });
       return { data: stripeState.subscriptions[params.customer] || [] };
     },
+    async retrieve(id) {
+      stripeState.calls.push({ fn: 'subscriptions.retrieve', id });
+      for (const [customer, subs] of Object.entries(stripeState.subscriptions)) {
+        const sub = subs.find((s) => s.id === id);
+        if (sub) return { customer, ...sub };
+      }
+      const err = new Error(`No such subscription: '${id}'`);
+      err.code = 'resource_missing';
+      throw err;
+    },
   },
 };
 

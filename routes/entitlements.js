@@ -4,6 +4,7 @@ const crypto = require('crypto');
 const Stripe = require('stripe');
 const { createClient } = require('@supabase/supabase-js');
 const { requireUser, requireMakeSecret } = require('../src/auth');
+const { decideLmsAction, callLms, SUSPEND_STATUSES } = require('../src/lmsSync');
 
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 const supabase = createClient(
@@ -430,9 +431,66 @@ router.post('/grant-access', async (req, res) => {
   }
 });
 
+// Email du client Stripe, ou null s'il est supprimé ou sans email.
+async function getStripeCustomerEmail(stripeCustomerId) {
+  try {
+    const customer = await stripe.customers.retrieve(stripeCustomerId);
+    return customer && !customer.deleted ? normalizeEmail(customer.email) : null;
+  } catch (err) {
+    if (err && err.code === 'resource_missing') return null;
+    throw err;
+  }
+}
+
+// Formation WordPress : suspend ou réinscrit selon le statut RÉEL de l'abonnement
+// (relu chez Stripe, l'ordre d'arrivée des webhooks n'étant pas garanti).
+// Ne lève jamais : l'entitlement est déjà à jour, le résultat est renvoyé à Make.
+async function syncLmsAccess({ stripeCustomerId, subscriptionId, previousStatus, fallbackEmail }) {
+  try {
+    let sub;
+    try {
+      sub = await stripe.subscriptions.retrieve(subscriptionId);
+    } catch (err) {
+      if (err && err.code === 'resource_missing') return { action: 'none', reason: 'unknown_subscription' };
+      throw err;
+    }
+    const subCustomer = typeof sub.customer === 'string' ? sub.customer : sub.customer?.id;
+    if (subCustomer !== stripeCustomerId) {
+      console.warn(`[lms-sync] Abonnement ${subscriptionId} d'un autre client que ${stripeCustomerId} : ignoré.`);
+      return { action: 'none', reason: 'subscription_customer_mismatch' };
+    }
+
+    const isTransmission = isTransmissionSub(sub);
+    let hasOtherActiveAppSub = false;
+    if (!isTransmission && SUSPEND_STATUSES.includes(sub.status)) {
+      const others = await stripe.subscriptions.list({ customer: stripeCustomerId, status: 'all', limit: 100 });
+      hasOtherActiveAppSub = others.data.some((s) =>
+        s.id !== sub.id && ACTIVE_LIKE_STATUSES.includes(s.status) && !isTransmissionSub(s)
+      );
+    }
+
+    const decision = decideLmsAction({ liveStatus: sub.status, previousStatus, isTransmission, hasOtherActiveAppSub });
+    if (decision.action === 'none') return decision;
+
+    const email = (await getStripeCustomerEmail(stripeCustomerId)) || normalizeEmail(fallbackEmail);
+    if (!email) {
+      console.error(`[lms-sync] ${decision.action} impossible pour ${stripeCustomerId} : aucun email.`);
+      return { ...decision, ok: false, error: 'no_email' };
+    }
+
+    return { ...decision, ...(await callLms(decision.action, email)) };
+  } catch (err) {
+    console.error('[lms-sync] Erreur :', err.message);
+    return { action: 'error', ok: false, error: 'sync_failed' };
+  }
+}
+
 // POST /api/update-entitlement
+// Corps : { stripeCustomerId, status, trialEndsAt?, subscriptionId?, previousStatus? }
+// subscriptionId (data.object.id) active la synchronisation de la formation WordPress ;
+// previousStatus (data.previous_attributes.status) permet de détecter une réactivation.
 router.post('/update-entitlement', requireMakeSecret, async (req, res) => {
-  const { stripeCustomerId, status, trialEndsAt } = req.body;
+  const { stripeCustomerId, status, trialEndsAt, subscriptionId, previousStatus } = req.body;
 
   if (typeof stripeCustomerId !== 'string' || !stripeCustomerId || !status) {
     return res.status(400).json({ error: 'stripeCustomerId et status requis.' });
@@ -448,7 +506,7 @@ router.post('/update-entitlement', requireMakeSecret, async (req, res) => {
   try {
     const { data: existing, error: fetchError } = await supabase
       .from('entitlements')
-      .select('supabase_user_id, status, access_expires_at')
+      .select('supabase_user_id, status, access_expires_at, purchase_email')
       .eq('stripe_customer_id', stripeCustomerId)
       .single();
 
@@ -463,6 +521,24 @@ router.post('/update-entitlement', requireMakeSecret, async (req, res) => {
     const updatePayload = { status, updated_at: new Date().toISOString() };
     if (trialEndsAt) updatePayload.trial_ends_at = trialEndsAt;
 
+    // Garde-fou : un statut inactif ne retire pas l'accès si le client a encore
+    // un autre abonnement app actif ou en essai (hors La Transmission), relu chez
+    // Stripe. L'entitlement bascule alors sur cet abonnement.
+    let keptSubscriptionId = null;
+    if (!ACTIVE_LIKE_STATUSES.includes(status)) {
+      const subscriptions = await stripe.subscriptions.list({ customer: stripeCustomerId, status: 'all', limit: 100 });
+      const stillActive = pickRelevantAppSub(subscriptions.data);
+      if (stillActive) {
+        keptSubscriptionId = stillActive.id;
+        updatePayload.status = stillActive.status;
+        updatePayload.stripe_subscription_id = stillActive.id;
+        updatePayload.trial_ends_at = stillActive.trial_end
+          ? new Date(stillActive.trial_end * 1000).toISOString()
+          : null;
+        console.warn(`[update-entitlement] ${stripeCustomerId} : statut ${status} reçu, accès gardé par l'abonnement ${stillActive.id} (${stillActive.status}).`);
+      }
+    }
+
     const { error } = await supabase
       .from('entitlements')
       .update(updatePayload)
@@ -471,11 +547,28 @@ router.post('/update-entitlement', requireMakeSecret, async (req, res) => {
     if (error) throw error;
 
     if (existing?.supabase_user_id) {
-      const isPremium = ACTIVE_LIKE_STATUSES.includes(status);
+      const isPremium = ACTIVE_LIKE_STATUSES.includes(updatePayload.status);
       await syncAiQuotaPremium(existing.supabase_user_id, isPremium);
     }
 
-    res.json({ updated: true });
+    const result = { updated: true };
+    if (keptSubscriptionId) {
+      result.status = updatePayload.status;
+      result.keptActiveSubscription = keptSubscriptionId;
+    }
+
+    // Sans subscriptionId (ancien mapping Make), pas de synchronisation de la formation.
+    if (typeof subscriptionId !== 'string' || !subscriptionId) {
+      return res.json(result);
+    }
+
+    result.lms = await syncLmsAccess({
+      stripeCustomerId,
+      subscriptionId,
+      previousStatus: STRIPE_SUBSCRIPTION_STATUSES.includes(previousStatus) ? previousStatus : undefined,
+      fallbackEmail: existing?.purchase_email,
+    });
+    res.json(result);
   } catch (err) {
     console.error('Erreur update-entitlement:', err.message);
     res.status(500).json({ error: err.message });
