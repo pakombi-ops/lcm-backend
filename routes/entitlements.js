@@ -67,6 +67,31 @@ function isReplaceablePrenom(current) {
   return trimmed === '' || trimmed === PLACEHOLDER_PRENOM;
 }
 
+// Profil (upsert idempotent, ne dépend d'aucun trigger existant ou non).
+// Le prénom n'est écrit que s'il manque ou vaut encore « Utilisateur » : on
+// n'écrase jamais un prénom choisi dans l'app, et un nom vide n'efface rien
+// (la colonne absente de l'upsert garde sa valeur).
+async function upsertProfile(userId, normalizedEmail, firstName, logTag) {
+  const profileRow = {
+    id: userId,
+    email: normalizedEmail,
+    updated_at: new Date().toISOString(),
+  };
+  if (firstName) {
+    const { data: currentProfile, error: profileError } = await supabase
+      .from('profiles')
+      .select('prenom')
+      .eq('id', userId)
+      .maybeSingle();
+    if (profileError) {
+      console.warn(`[${logTag}] Lecture du profil impossible, prénom laissé tel quel : ${profileError.message}`);
+    } else if (isReplaceablePrenom(currentProfile?.prenom)) {
+      profileRow.prenom = firstName;
+    }
+  }
+  await supabase.from('profiles').upsert(profileRow, { onConflict: 'id' });
+}
+
 function isTransmissionSub(sub) {
   return (sub?.items?.data || []).some((item) =>
     TRANSMISSION_PRICE_IDS.includes(item?.price?.id)
@@ -275,28 +300,8 @@ router.post('/provision-account', requireMakeSecret, async (req, res) => {
       created = result.created;
     }
 
-    // 3. Profil (upsert idempotent, ne dépend d'aucun trigger existant ou non).
-    // Le prénom n'est écrit que s'il manque ou vaut encore « Utilisateur » : on
-    // n'écrase jamais un prénom choisi dans l'app, et un nom vide n'efface rien
-    // (la colonne absente de l'upsert garde sa valeur).
-    const profileRow = {
-      id: userId,
-      email: normalizedEmail,
-      updated_at: new Date().toISOString(),
-    };
-    if (firstName) {
-      const { data: currentProfile, error: profileError } = await supabase
-        .from('profiles')
-        .select('prenom')
-        .eq('id', userId)
-        .maybeSingle();
-      if (profileError) {
-        console.warn(`[provision-account] Lecture du profil impossible, prénom laissé tel quel : ${profileError.message}`);
-      } else if (isReplaceablePrenom(currentProfile?.prenom)) {
-        profileRow.prenom = firstName;
-      }
-    }
-    await supabase.from('profiles').upsert(profileRow, { onConflict: 'id' });
+    // 3. Profil : prénom écrit seulement s'il est vide ou vaut « Utilisateur ».
+    await upsertProfile(userId, normalizedEmail, firstName, 'provision-account');
 
     // 4. Entitlement.
     // Garde-fou : sans abonnement app, on ne rétrograde JAMAIS un accès à durée
@@ -383,14 +388,11 @@ router.post('/grant-access', async (req, res) => {
 
   try {
     const normalizedEmail = email.trim().toLowerCase();
-    const { userId, created } = await findOrCreateSupabaseUser(normalizedEmail, prenom);
+    const firstName = firstNameFrom(prenom);
+    const { userId, created } = await findOrCreateSupabaseUser(normalizedEmail, firstName);
 
-    await supabase.from('profiles').upsert({
-      id: userId,
-      email: normalizedEmail,
-      prenom: prenom || null,
-      updated_at: new Date().toISOString(),
-    }, { onConflict: 'id' });
+    // Profil : prénom écrit seulement s'il est vide ou vaut « Utilisateur ».
+    await upsertProfile(userId, normalizedEmail, firstName, 'grant-access');
 
     // Si un accès à durée fixe plus long existe déjà, on garde la date la plus lointaine.
     const existing = await getEntitlementByUserId(userId);

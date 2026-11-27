@@ -263,3 +263,52 @@ for (const prenom of [undefined, '', '   ', null]) {
     assert.equal('prenom' in write.row, false);
   });
 }
+
+// ------------------------------------------------------------ grant-access (La Transmission) : même règle pour le prénom
+
+async function grantWithProfile(t, profile, prenom) {
+  resetSupabase({
+    authUsers: [{ id: 'u1', email: 'homme@exemple.fr' }],
+    tables: profile ? { profiles: [{ id: 'u1', ...profile }] } : {},
+  });
+  const ctx = await start();
+  t.after(ctx.close);
+  const expiresAt = new Date(Date.now() + 90 * 24 * 3600 * 1000).toISOString();
+  const body = { email: 'homme@exemple.fr', planType: 'transmission_groupe', expiresAt };
+  if (prenom !== undefined) body.prenom = prenom;
+  const res = await postJson(`${ctx.baseUrl}/api/grant-access`, body, MAKE);
+  assert.equal(res.status, 200, JSON.stringify(await res.clone().json()));
+  return supabaseState.tables.profiles.find((p) => p.id === 'u1');
+}
+
+for (const current of [undefined, null, '', 'Utilisateur']) {
+  test(`grant-access : prénom actuel ${JSON.stringify(current)} → remplacé par le premier mot du nom`, async (t) => {
+    const profile = await grantWithProfile(t, current === undefined ? null : { prenom: current }, ' Jean Dupont ');
+    assert.equal(profile.prenom, 'Jean');
+  });
+}
+
+test('grant-access : un prénom choisi dans l’app n’est jamais écrasé', async (t) => {
+  const profile = await grantWithProfile(t, { prenom: 'Johann' }, 'Jean Dupont');
+  assert.equal(profile.prenom, 'Johann');
+});
+
+for (const prenom of [undefined, '', '   ', null]) {
+  test(`grant-access : nom ${JSON.stringify(prenom)} depuis Make → le prénom existant n’est pas effacé`, async (t) => {
+    const profile = await grantWithProfile(t, { prenom: 'Johann' }, prenom);
+    assert.equal(profile.prenom, 'Johann');
+    const write = supabaseState.writes.find((w) => w.table === 'profiles' && w.op === 'upsert');
+    assert.equal('prenom' in write.row, false);
+  });
+}
+
+test('grant-access : nouveau compte → prénom = premier mot', async (t) => {
+  resetSupabase();
+  const ctx = await start();
+  t.after(ctx.close);
+  const expiresAt = new Date(Date.now() + 90 * 24 * 3600 * 1000).toISOString();
+  const res = await postJson(`${ctx.baseUrl}/api/grant-access`, { email: 'neuf@exemple.fr', prenom: 'Marc Antoine', planType: 'transmission_1a1', expiresAt }, MAKE);
+  assert.equal(res.status, 200);
+  const { userId } = await res.json();
+  assert.equal(supabaseState.tables.profiles.find((p) => p.id === userId).prenom, 'Marc');
+});
