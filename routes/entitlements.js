@@ -48,6 +48,25 @@ function normalizeEmail(value) {
   return normalized || null;
 }
 
+// Prénom par défaut posé à la création du compte dans l'app : il peut être remplacé.
+const PLACEHOLDER_PRENOM = 'utilisateur';
+
+// Make envoie le nom complet saisi dans Stripe Checkout (customer_details.name) :
+// on n'en garde que le premier mot, sans espaces. « Jean Dupont » → « Jean »,
+// « Jean-Pierre Martin » → « Jean-Pierre ». null si absent, vide ou non textuel.
+function firstNameFrom(value) {
+  if (typeof value !== 'string') return null;
+  const first = value.trim().split(/\s+/)[0];
+  return first ? first.slice(0, 50) : null;
+}
+
+// Vrai si le prénom actuel du profil peut être remplacé : absent, vide ou « Utilisateur ».
+function isReplaceablePrenom(current) {
+  if (typeof current !== 'string') return true;
+  const trimmed = current.trim().toLowerCase();
+  return trimmed === '' || trimmed === PLACEHOLDER_PRENOM;
+}
+
 function isTransmissionSub(sub) {
   return (sub?.items?.data || []).some((item) =>
     TRANSMISSION_PRICE_IDS.includes(item?.price?.id)
@@ -248,19 +267,36 @@ router.post('/provision-account', requireMakeSecret, async (req, res) => {
       // retombe sur la recherche/création par email ci-dessous.
     }
 
+    const firstName = firstNameFrom(prenom);
+
     if (!userId) {
-      const result = await findOrCreateSupabaseUser(normalizedEmail, prenom);
+      const result = await findOrCreateSupabaseUser(normalizedEmail, firstName);
       userId = result.userId;
       created = result.created;
     }
 
-    // 3. Profil (upsert idempotent, ne dépend d'aucun trigger existant ou non)
-    await supabase.from('profiles').upsert({
+    // 3. Profil (upsert idempotent, ne dépend d'aucun trigger existant ou non).
+    // Le prénom n'est écrit que s'il manque ou vaut encore « Utilisateur » : on
+    // n'écrase jamais un prénom choisi dans l'app, et un nom vide n'efface rien
+    // (la colonne absente de l'upsert garde sa valeur).
+    const profileRow = {
       id: userId,
       email: normalizedEmail,
-      prenom: prenom || null,
       updated_at: new Date().toISOString(),
-    }, { onConflict: 'id' });
+    };
+    if (firstName) {
+      const { data: currentProfile, error: profileError } = await supabase
+        .from('profiles')
+        .select('prenom')
+        .eq('id', userId)
+        .maybeSingle();
+      if (profileError) {
+        console.warn(`[provision-account] Lecture du profil impossible, prénom laissé tel quel : ${profileError.message}`);
+      } else if (isReplaceablePrenom(currentProfile?.prenom)) {
+        profileRow.prenom = firstName;
+      }
+    }
+    await supabase.from('profiles').upsert(profileRow, { onConflict: 'id' });
 
     // 4. Entitlement.
     // Garde-fou : sans abonnement app, on ne rétrograde JAMAIS un accès à durée
@@ -520,3 +556,4 @@ router.get('/programme-status', requireMakeSecret, async (req, res) => {
 module.exports = router;
 module.exports.STRIPE_SUBSCRIPTION_STATUSES = STRIPE_SUBSCRIPTION_STATUSES;
 module.exports.normalizeEmail = normalizeEmail;
+module.exports.firstNameFrom = firstNameFrom;

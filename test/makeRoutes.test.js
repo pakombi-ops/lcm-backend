@@ -9,7 +9,7 @@ process.env.MAKE_SHARED_SECRET = SECRET;
 
 const express = require('express');
 const entitlementsRoutes = require('../routes/entitlements');
-const { STRIPE_SUBSCRIPTION_STATUSES, normalizeEmail } = require('../routes/entitlements');
+const { STRIPE_SUBSCRIPTION_STATUSES, normalizeEmail, firstNameFrom } = require('../routes/entitlements');
 
 const MAKE = { 'x-make-secret': SECRET };
 
@@ -217,3 +217,49 @@ test('provision-account : 400 si email ou stripeCustomerId ne sont pas des chaî
     assert.equal(res.status, 400, JSON.stringify(body));
   }
 });
+
+// ------------------------------------------------------------ provision-account : prénom depuis customer_details.name
+
+test('firstNameFrom : premier mot, espaces retirés, null si vide ou non textuel', () => {
+  assert.equal(firstNameFrom('Jean Dupont'), 'Jean');
+  assert.equal(firstNameFrom('  Tonton Claude '), 'Tonton');
+  assert.equal(firstNameFrom('Jean-Pierre Martin'), 'Jean-Pierre');
+  assert.equal(firstNameFrom('\tJo\n'), 'Jo');
+  for (const v of ['', '   ', null, undefined, 42, {}]) assert.equal(firstNameFrom(v), null);
+});
+
+async function provisionWithProfile(t, profile, prenom) {
+  resetSupabase({
+    authUsers: [{ id: 'u1', email: 'homme@exemple.fr' }],
+    tables: profile ? { profiles: [{ id: 'u1', ...profile }] } : {},
+  });
+  resetStripe({ customers: [{ id: 'cus_1', email: 'homme@exemple.fr' }], subscriptions: { cus_1: [activeSub()] } });
+  const ctx = await start();
+  t.after(ctx.close);
+  const body = { email: 'homme@exemple.fr', stripeCustomerId: 'cus_1', supabaseUserId: '' };
+  if (prenom !== undefined) body.prenom = prenom;
+  const res = await postJson(`${ctx.baseUrl}/api/provision-account`, body, MAKE);
+  assert.equal(res.status, 200);
+  return supabaseState.tables.profiles.find((p) => p.id === 'u1');
+}
+
+for (const current of [undefined, null, '', '  ', 'Utilisateur', 'utilisateur ']) {
+  test(`provision-account : prénom actuel ${JSON.stringify(current)} → remplacé par le premier mot du nom`, async (t) => {
+    const profile = await provisionWithProfile(t, current === undefined ? null : { prenom: current }, '  Tonton Claude ');
+    assert.equal(profile.prenom, 'Tonton');
+  });
+}
+
+test('provision-account : un prénom choisi dans l’app n’est jamais écrasé', async (t) => {
+  const profile = await provisionWithProfile(t, { prenom: 'Johann' }, 'Jean Dupont');
+  assert.equal(profile.prenom, 'Johann');
+});
+
+for (const prenom of [undefined, '', '   ', null]) {
+  test(`provision-account : nom ${JSON.stringify(prenom)} depuis Make → le prénom existant n’est pas effacé`, async (t) => {
+    const profile = await provisionWithProfile(t, { prenom: 'Utilisateur' }, prenom);
+    assert.equal(profile.prenom, 'Utilisateur');
+    const write = supabaseState.writes.find((w) => w.table === 'profiles' && w.op === 'upsert');
+    assert.equal('prenom' in write.row, false);
+  });
+}
