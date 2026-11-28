@@ -114,3 +114,18 @@ test('billing-portal : Transmission terminée → portail normal', async (t) => 
   assert.equal(status, 200);
   assert.equal(portalCalls()[0].params.configuration, undefined);
 });
+
+// ------------------------------------------------------------ entitlement-status : hasSubscription
+const { hasManageableSubscription } = require('../routes/entitlements');
+
+test('hasSubscription : vrai seulement avec un client Stripe et un abonnement en cours', () => {
+  for (const status of ['trialing', 'active', 'past_due', 'unpaid', 'paused', 'incomplete']) {
+    assert.equal(hasManageableSubscription({ stripe_customer_id: 'cus_1', status }), true, status);
+  }
+  for (const status of ['canceled', 'incomplete_expired', null]) {
+    assert.equal(hasManageableSubscription({ stripe_customer_id: 'cus_1', status }), false, String(status));
+  }
+  assert.equal(hasManageableSubscription({ stripe_customer_id: null, status: 'active' }), false);
+  assert.equal(hasManageableSubscription({ stripe_customer_id: 'founder', status: 'active' }), false);
+  assert.equal(hasManageableSubscription(null), false);
+});
