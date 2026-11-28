@@ -9,6 +9,7 @@ const { requireUser } = require('./auth');
 const { detectCrisis, CRISIS_REPLY } = require('./safety');
 const { createQuota } = require('./quota');
 const { validateChatBody } = require('./chatValidation');
+const { createRequireConsent } = require('./consent');
 const { createClient } = require('@supabase/supabase-js');
 const entitlementsRoutes = require('../routes/entitlements');
 
@@ -76,7 +77,9 @@ const userDailyLimiter = rateLimit({
   keyGenerator: byUser,
   message: { error: 'daily_limit', message: 'Limite quotidienne atteinte. Reviens demain.' },
 });
-const chatGuards = [chatLimiter, requireUser, userMinuteLimiter, userDailyLimiter];
+// 3) consentement explicite au coach (données pouvant révéler la santé) : 403 consent_required sans accord.
+const requireCoachConsent = createRequireConsent(createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY), 'coach');
+const chatGuards = [chatLimiter, requireUser, userMinuteLimiter, userDailyLimiter, requireCoachConsent];
 
 // GET /api/health
 app.get('/api/health', (req, res) => {

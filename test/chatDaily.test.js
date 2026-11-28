@@ -20,7 +20,10 @@ test('limite quotidienne par compte → 429 daily_limit', async () => {
   const user = { id: 'premium-1', email: 'p@exemple.fr' };
   resetSupabase({
     tokens: { jeton: user },
-    tables: { entitlements: [{ supabase_user_id: 'premium-1', status: 'active', access_expires_at: null }] },
+    tables: {
+      entitlements: [{ supabase_user_id: 'premium-1', status: 'active', access_expires_at: null }],
+      user_consents: [{ user_id: 'premium-1', purpose: 'coach', action: 'granted' }],
+    },
   });
   const auth = { Authorization: 'Bearer jeton' };
   const send = () => postJson(`${server.baseUrl}/api/chat-simple`, { message: 'Salut' }, auth);

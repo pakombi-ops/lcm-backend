@@ -12,7 +12,8 @@ const ROOT = path.join(__dirname, '..', '..');
 // ------------------------------------------------------------------ Supabase
 const supabaseState = {};
 
-function resetSupabase({ tables = {}, authUsers = [], tokens = {} } = {}) {
+function resetSupabase({ tables = {}, authUsers = [], tokens = {}, consentError = false } = {}) {
+  supabaseState.consentError = consentError;
   supabaseState.tables = JSON.parse(JSON.stringify(tables));
   supabaseState.authUsers = authUsers.map((u) => ({ ...u }));
   supabaseState.tokens = { ...tokens }; // jeton → utilisateur Supabase
@@ -87,6 +88,14 @@ const fakeSupabase = {
   },
   async rpc(name, params) {
     supabaseState.rpcCalls.push({ name, params });
+    if (name === 'has_consent') {
+      // Dernier événement de la table user_consents pour ce compte et cet objet.
+      if (supabaseState.consentError) return { data: null, error: { message: 'base indisponible' } };
+      const events = rowsOf('user_consents')
+        .filter((r) => r.user_id === params.p_user_id && r.purpose === params.p_purpose);
+      const last = events[events.length - 1];
+      return { data: !!last && last.action === 'granted', error: null };
+    }
     if (name === 'get_user_id_by_email') {
       const user = supabaseState.authUsers.find((u) => u.email === params.p_email);
       return { data: user ? user.id : null, error: null };

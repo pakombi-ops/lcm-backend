@@ -19,7 +19,8 @@ function newUser() {
   n += 1;
   const user = { id: `user-${n}`, email: `u${n}@exemple.fr`, email_confirmed_at: '2026-01-01T00:00:00Z' };
   const token = `jeton-${n}`;
-  resetSupabase({ tokens: { [token]: user } });
+  // Accord au coach donné : le contrôle du consentement est testé dans consent.test.js.
+  resetSupabase({ tokens: { [token]: user }, tables: { user_consents: [{ user_id: user.id, purpose: 'coach', action: 'granted' }] } });
   return { user, auth: { Authorization: `Bearer ${token}` } };
 }
 
