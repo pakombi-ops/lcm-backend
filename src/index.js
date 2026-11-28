@@ -11,6 +11,7 @@ const { createQuota } = require('./quota');
 const { validateChatBody } = require('./chatValidation');
 const { createClient } = require('@supabase/supabase-js');
 const entitlementsRoutes = require('../routes/entitlements');
+const accountRoutes = require('../routes/account');
 
 const app = express();
 app.set('trust proxy', 1); // Railway : IP réelle pour le rate limiting
@@ -53,6 +54,8 @@ app.options('*', cors()); // Gère les pre-flight requests mobiles
 // 64 Ko suffisent largement : message ≤ 2000 caractères + 20 messages d'historique.
 app.use(express.json({ limit: '64kb' }));
 app.use('/api', entitlementsRoutes);
+// Suppression de compte (DELETE /api/account) et tâche de conservation (Make).
+app.use('/api', accountRoutes);
 
 // Rate limiting
 // 1) par IP, AVANT la vérification du jeton : limite aussi les appels sans compte.
@@ -179,37 +182,6 @@ app.post('/api/chat-simple', chatGuards, async (req, res) => {
   }
 });
 // Démarrage
-// Suppression de compte (exigée par les stores). NON déployé, prototype.
-// 1) confirmation récente : connexion par mot de passe il y a moins de 5 min (last_sign_in_at) ;
-// 2) refus si abonnement actif (à annuler d'abord, nous n'annulons pas Stripe) ;
-// 3) UNE seule opération : suppression du compte auth. Les tables de l'utilisateur sont liées à auth.users par
-//    ON DELETE CASCADE (entitlements incluse, décision de Prince : tout est supprimé) : la base fait tout
-//    ou rien dans sa propre transaction. Plus d'étape préalable qui efface les données avant le compte.
-//    Prérequis : option-A-suppression-atomique.sql appliqué. Sans lui, la suppression échoue AVANT d'effacer quoi que ce soit.
-const adminDb = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
-const REAUTH_MAX_MS = 5 * 60 * 1000;
-// Interrupteur du lot suppression : la route reste désactivée (503, aucune lecture ni écriture) tant que ENABLE_ACCOUNT_DELETE !== 'true'.
-// Permet de livrer le lot sécurité (quota/droits) sans rendre ce chemin disponible avant sa validation sur Supabase hébergé.
-app.delete('/api/account', requireUser, async (req, res) => {
-  if (process.env.ENABLE_ACCOUNT_DELETE !== 'true') return res.status(503).json({ error: 'delete_unavailable' });
-  const uid = req.user.id;
-  const last = Date.parse(req.user.last_sign_in_at || '');
-  if (!last || Date.now() - last > REAUTH_MAX_MS) return res.status(403).json({ error: 'reauth_required' });
-  try {
-    const { data: ent, error: ee } = await adminDb.from('entitlements').select('status, access_expires_at').eq('supabase_user_id', uid);
-    if (ee) throw new Error('entitlements: ' + ee.message);
-    const live = (ent || []).filter(e => ['trialing', 'active'].includes(e.status) && (!e.access_expires_at || Date.parse(e.access_expires_at) > Date.now()));
-    // accès à durée fixe en cours (ex. La Transmission) : pas d'abonnement à annuler, distinct du cas récurrent
-    if (live.length) return res.status(409).json({ error: live.some(e => !e.access_expires_at) ? 'active_subscription' : 'active_access' });
-    const { error: ae } = await adminDb.auth.admin.deleteUser(uid);
-    if (ae) throw new Error('auth: ' + ae.message);
-    res.json({ deleted: true });
-  } catch (err) {
-    console.error('account delete:', err.message);
-    res.status(500).json({ error: 'delete_failed' });
-  }
-});
-
 // Erreurs de lecture du corps (JSON invalide, corps > 64 Ko) : réponse JSON courte,
 // sans la trace de pile qu'affiche le gestionnaire par défaut d'Express.
 app.use((err, req, res, next) => {

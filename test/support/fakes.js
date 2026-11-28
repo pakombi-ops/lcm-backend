@@ -18,16 +18,21 @@ function resetSupabase({ tables = {}, authUsers = [], tokens = {} } = {}) {
   supabaseState.tokens = { ...tokens }; // jeton → utilisateur Supabase
   supabaseState.writes = [];
   supabaseState.rpcCalls = [];
+  supabaseState.rpcHandlers = {}; // nom → async (params) => { data, error }
 }
 
 const rowsOf = (table) => (supabaseState.tables[table] = supabaseState.tables[table] || []);
 
 function fromTable(table) {
   const filters = [];
-  const matches = (row) => filters.every(([col, val]) => row[col] === val);
+  const matches = (row) => filters.every(([col, val]) => (val === null ? (row[col] ?? null) === null : row[col] === val));
   const query = {
     select() { return query; },
     eq(col, val) { filters.push([col, val]); return query; },
+    is(col, val) { filters.push([col, val]); return query; },
+    then(resolve, reject) {
+      return Promise.resolve({ data: rowsOf(table).filter(matches).map((r) => ({ ...r })), error: null }).then(resolve, reject);
+    },
     in() { return query; },
     order() { return query; },
     limit() { return query; },
@@ -47,6 +52,19 @@ function fromTable(table) {
       supabaseState.writes.push({ table, op: 'insert', row });
       rowsOf(table).push({ ...row });
       return { data: null, error: null };
+    },
+    delete() {
+      const dfilters = [];
+      const chain = {
+        eq(col, val) { dfilters.push([col, val]); return chain; },
+        then(resolve, reject) {
+          const keep = rowsOf(table).filter((r) => !dfilters.every(([c, v]) => r[c] === v));
+          supabaseState.writes.push({ table, op: 'delete', filter: dfilters });
+          supabaseState.tables[table] = keep;
+          return Promise.resolve({ data: null, error: null }).then(resolve, reject);
+        },
+      };
+      return chain;
     },
     update(payload) {
       const ufilters = [];
@@ -87,6 +105,7 @@ const fakeSupabase = {
   },
   async rpc(name, params) {
     supabaseState.rpcCalls.push({ name, params });
+    if (supabaseState.rpcHandlers[name]) return supabaseState.rpcHandlers[name](params);
     if (name === 'get_user_id_by_email') {
       const user = supabaseState.authUsers.find((u) => u.email === params.p_email);
       return { data: user ? user.id : null, error: null };
@@ -126,6 +145,16 @@ const fakeStripe = {
     async list(params) {
       stripeState.calls.push({ fn: 'subscriptions.list', params });
       return { data: stripeState.subscriptions[params.customer] || [] };
+    },
+    async cancel(id, params) {
+      stripeState.calls.push({ fn: 'subscriptions.cancel', id, params });
+      for (const subs of Object.values(stripeState.subscriptions)) {
+        const sub = subs.find((s) => s.id === id);
+        if (sub) { sub.status = 'canceled'; return { ...sub }; }
+      }
+      const err = new Error(`No such subscription: '${id}'`);
+      err.code = 'resource_missing';
+      throw err;
     },
     async retrieve(id) {
       stripeState.calls.push({ fn: 'subscriptions.retrieve', id });
