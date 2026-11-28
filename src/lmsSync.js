@@ -3,9 +3,10 @@
 //
 // Règles (statut RÉEL de l'abonnement, relu chez Stripe) :
 //   canceled, unpaid, paused, incomplete_expired → suspendre (/pc-lms/v1/suspend),
-//       sauf si le client a un autre abonnement app actif ou en essai ;
-//   active / trialing, venant d'un statut inactif (previousStatus) → réinscrire (/enroll) ;
-//   past_due, cancel_at_period_end, renouvellement (pas de changement de statut) → rien ;
+//       sauf si le client a un autre abonnement app actif, en essai ou en retard de paiement ;
+//   active / trialing, venant d'un statut suspendu (previousStatus) → réinscrire (/enroll) ;
+//   past_due (accès gardé, comme dans l'app), retour de past_due à active,
+//   cancel_at_period_end, renouvellement (pas de changement de statut) → rien ;
 //   abonnement La Transmission → rien.
 //
 // Variables Railway : PC_LMS_SECRET (en-tête X-PC-Secret, même valeur que l'option
@@ -13,7 +14,9 @@
 
 const SUSPEND_STATUSES = ['canceled', 'unpaid', 'paused', 'incomplete_expired'];
 const ACTIVE_LIKE_STATUSES = ['trialing', 'active'];
-const INACTIVE_PREVIOUS_STATUSES = ['past_due', 'unpaid', 'paused', 'incomplete', 'incomplete_expired', 'canceled'];
+// past_due n'en fait pas partie : pendant un retard de paiement la formation n'est
+// pas suspendue, il n'y a donc rien à réinscrire quand le paiement passe.
+const INACTIVE_PREVIOUS_STATUSES = ['unpaid', 'paused', 'incomplete', 'incomplete_expired', 'canceled'];
 const DEFAULT_BASE_URL = 'https://pilierconscient.com';
 const TIMEOUT_MS = 10000;
 
@@ -40,7 +43,7 @@ function decideLmsAction({ liveStatus, previousStatus, isTransmission, hasOtherA
     return { action: 'none', reason: 'no_reactivation' };
   }
 
-  // past_due (Stripe retente le paiement), incomplete : on attend.
+  // past_due (Stripe retente le paiement, accès gardé), incomplete : on attend.
   return { action: 'none', reason: `status_${liveStatus}_wait` };
 }
 
