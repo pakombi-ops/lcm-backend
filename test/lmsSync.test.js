@@ -53,13 +53,14 @@ test('decideLmsAction : table des règles', () => {
   const d = (liveStatus, previousStatus, extra = {}) =>
     decideLmsAction({ liveStatus, previousStatus, isTransmission: false, hasOtherActiveAppSub: false, ...extra }).action;
   for (const s of ['canceled', 'unpaid', 'paused', 'incomplete_expired']) assert.equal(d(s), 'suspend', s);
-  for (const prev of ['past_due', 'unpaid', 'paused', 'incomplete', 'incomplete_expired', 'canceled']) {
+  for (const prev of ['unpaid', 'paused', 'incomplete', 'incomplete_expired', 'canceled']) {
     assert.equal(d('active', prev), 'enroll', prev);
     assert.equal(d('trialing', prev), 'enroll', prev);
   }
   assert.equal(d('active', undefined), 'none', 'renouvellement ou cancel_at_period_end');
   assert.equal(d('active', 'trialing'), 'none', 'fin d’essai payée');
   assert.equal(d('past_due', 'active'), 'none', 'past_due : Stripe retente');
+  assert.equal(d('active', 'past_due'), 'none', 'paiement rattrapé : la formation n’a jamais été suspendue');
   assert.equal(d('incomplete', undefined), 'none');
   assert.equal(d('canceled', undefined, { isTransmission: true }), 'none', 'Transmission');
   assert.equal(d('canceled', undefined, { hasOtherActiveAppSub: true }), 'none', 'autre abonnement actif');
@@ -169,7 +170,7 @@ test('abonnement inconnu chez Stripe : ignoré, entitlement quand même mis à j
 
 // ------------------------------------------------------------ réinscription
 
-for (const prev of ['past_due', 'unpaid', 'paused', 'incomplete', 'canceled']) {
+for (const prev of ['unpaid', 'paused', 'incomplete', 'canceled']) {
   test(`retour à active depuis ${prev} : /enroll`, async (t) => {
     resetStripe({ customers: [{ id: 'cus_1', email: 'homme@exemple.fr' }], subscriptions: { cus_1: [sub('sub_1', 'active')] } });
     const { body } = await update(t, { status: 'active', subscriptionId: 'sub_1', previousStatus: prev });
@@ -179,7 +180,7 @@ for (const prev of ['past_due', 'unpaid', 'paused', 'incomplete', 'canceled']) {
   });
 }
 
-for (const [label, previousStatus] of [['renouvellement (pas de previousStatus)', undefined], ['cancel_at_period_end', undefined], ['fin d’essai', 'trialing'], ['statut précédent invalide', 'nimporte']]) {
+for (const [label, previousStatus] of [['renouvellement (pas de previousStatus)', undefined], ['cancel_at_period_end', undefined], ['fin d’essai', 'trialing'], ['paiement rattrapé après past_due', 'past_due'], ['statut précédent invalide', 'nimporte']]) {
   test(`active, ${label} : aucun appel WordPress`, async (t) => {
     resetStripe({ customers: [{ id: 'cus_1', email: 'homme@exemple.fr' }], subscriptions: { cus_1: [sub('sub_1', 'active')] } });
     const body = { status: 'active', subscriptionId: 'sub_1' };
@@ -236,7 +237,7 @@ test.after(() => { lmsSync.deps.fetch = realFetch; });
 
 // ------------------------------------------------------------ entitlement : aucun autre abonnement app actif
 
-for (const status of ['canceled', 'unpaid', 'paused', 'incomplete_expired', 'past_due']) {
+for (const status of ['canceled', 'unpaid', 'paused', 'incomplete_expired']) {
   test(`entitlement : ${status} reçu mais un autre abonnement app est en essai → accès gardé sur cet abonnement`, async (t) => {
     resetStripe({
       customers: [{ id: 'cus_1', email: 'homme@exemple.fr' }],
@@ -251,6 +252,38 @@ for (const status of ['canceled', 'unpaid', 'paused', 'incomplete_expired', 'pas
     assert.equal(quota.row.is_premium, true);
   });
 }
+
+test('entitlement : past_due reçu → Premium gardé (app alignée sur la formation), pas de relecture Stripe', async (t) => {
+  resetStripe({ customers: [{ id: 'cus_1', email: 'homme@exemple.fr' }], subscriptions: { cus_1: [sub('sub_1', 'past_due')] } });
+  const { stripeState } = require('./support/fakes');
+  const { body } = await update(t, { status: 'past_due' });
+  assert.deepEqual(body, { updated: true });
+  assert.equal(supabaseState.tables.entitlements[0].status, 'past_due');
+  assert.equal(supabaseState.writes.find((w) => w.table === 'ai_quota').row.is_premium, true);
+  assert.equal(stripeState.calls.filter((c) => c.fn === 'subscriptions.list').length, 0);
+});
+
+test('entitlement : canceled reçu, un autre abonnement est en retard de paiement → accès gardé sur celui-ci', async (t) => {
+  resetStripe({
+    customers: [{ id: 'cus_1', email: 'homme@exemple.fr' }],
+    subscriptions: { cus_1: [sub('sub_1', 'canceled'), { ...sub('sub_2', 'past_due'), created: 2 }] },
+  });
+  const { body } = await update(t, { status: 'canceled', subscriptionId: 'sub_1' });
+  assert.equal(body.status, 'past_due');
+  assert.equal(body.keptActiveSubscription, 'sub_2');
+  assert.equal(body.lms.reason, 'other_active_subscription');
+  assert.equal(supabaseState.writes.find((w) => w.table === 'ai_quota').row.is_premium, true);
+  assert.equal(wpCalls.length, 0);
+});
+
+test('entitlement : un abonnement à jour passe avant un plus récent en retard de paiement', async (t) => {
+  resetStripe({
+    customers: [{ id: 'cus_1', email: 'homme@exemple.fr' }],
+    subscriptions: { cus_1: [sub('sub_1', 'canceled'), { ...sub('sub_old', 'active'), created: 1 }, { ...sub('sub_new', 'past_due'), created: 5 }] },
+  });
+  const { body } = await update(t, { status: 'canceled' });
+  assert.deepEqual([body.status, body.keptActiveSubscription], ['active', 'sub_old']);
+});
 
 test('entitlement : seul un abonnement Transmission reste actif → il ne garde pas l’accès app', async (t) => {
   resetStripe({

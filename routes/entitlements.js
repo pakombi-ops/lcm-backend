@@ -5,15 +5,13 @@ const Stripe = require('stripe');
 const { createClient } = require('@supabase/supabase-js');
 const { requireUser, requireMakeSecret } = require('../src/auth');
 const { decideLmsAction, callLms, SUSPEND_STATUSES } = require('../src/lmsSync');
+const { PREMIUM_STATUSES } = require('../src/billingStatus');
 
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_KEY
 );
-
-// Statuts Stripe considérés comme donnant accès à l'app
-const ACTIVE_LIKE_STATUSES = ['trialing', 'active'];
 
 // La Transmission : identifiants des prix Stripe (séparés par des virgules,
 // variable d'environnement Railway TRANSMISSION_PRICE_IDS). Les abonnements
@@ -99,11 +97,14 @@ function isTransmissionSub(sub) {
   );
 }
 
-// Abonnement app le plus récent (actif ou en essai), hors La Transmission.
+// Abonnement app qui donne le Premium (essai, actif ou retard de paiement), hors
+// La Transmission. Un abonnement à jour passe avant un abonnement en retard de
+// paiement ; à égalité, le plus récent.
 function pickRelevantAppSub(subscriptions) {
+  const rank = (s) => (s.status === 'past_due' ? 1 : 0);
   return subscriptions
-    .filter((s) => ACTIVE_LIKE_STATUSES.includes(s.status) && !isTransmissionSub(s))
-    .sort((a, b) => b.created - a.created)[0];
+    .filter((s) => PREMIUM_STATUSES.includes(s.status) && !isTransmissionSub(s))
+    .sort((a, b) => rank(a) - rank(b) || b.created - a.created)[0];
 }
 
 // Vrai si l'utilisateur a encore un accès à durée fixe en cours.
@@ -111,7 +112,7 @@ function hasRunningFixedTermAccess(entitlement) {
   return Boolean(
     entitlement?.access_expires_at &&
     new Date(entitlement.access_expires_at) > new Date() &&
-    ACTIVE_LIKE_STATUSES.includes(entitlement.status)
+    PREMIUM_STATUSES.includes(entitlement.status)
   );
 }
 
@@ -267,7 +268,7 @@ router.post('/provision-account', requireMakeSecret, async (req, res) => {
       return res.status(403).json({ error: "L'email ne correspond pas au client Stripe.", code: 'email_mismatch' });
     }
 
-    // 1. Retrouver l'abonnement app réel (trialing ou active), hors La Transmission
+    // 1. Retrouver l'abonnement app réel (trialing, active ou past_due), hors La Transmission
     const subscriptions = await stripe.subscriptions.list({
       customer: stripeCustomerId,
       status: 'all',
@@ -330,7 +331,7 @@ router.post('/provision-account', requireMakeSecret, async (req, res) => {
 
       await supabase.from('entitlements').upsert(entitlementRow, { onConflict: 'supabase_user_id' });
 
-      await syncAiQuotaPremium(userId, ACTIVE_LIKE_STATUSES.includes(relevantSub?.status));
+      await syncAiQuotaPremium(userId, PREMIUM_STATUSES.includes(relevantSub?.status));
     }
 
     // Note : aucun email de définition de mot de passe n'est déclenché ici.
@@ -465,7 +466,7 @@ async function syncLmsAccess({ stripeCustomerId, subscriptionId, previousStatus,
     if (!isTransmission && SUSPEND_STATUSES.includes(sub.status)) {
       const others = await stripe.subscriptions.list({ customer: stripeCustomerId, status: 'all', limit: 100 });
       hasOtherActiveAppSub = others.data.some((s) =>
-        s.id !== sub.id && ACTIVE_LIKE_STATUSES.includes(s.status) && !isTransmissionSub(s)
+        s.id !== sub.id && PREMIUM_STATUSES.includes(s.status) && !isTransmissionSub(s)
       );
     }
 
@@ -514,7 +515,9 @@ router.post('/update-entitlement', requireMakeSecret, async (req, res) => {
 
     // Garde-fou : un événement d'abonnement ne retire jamais un accès à durée
     // fixe encore en cours (ex. fin du paiement en 3 fois de La Transmission).
-    if (!ACTIVE_LIKE_STATUSES.includes(status) && hasRunningFixedTermAccess(existing)) {
+    // past_due compris : écrit sur l'entitlement, il le sortirait de la tâche
+    // expire_fixed_term_access, qui ne fait expirer que 'active' et 'trialing'.
+    if (!['trialing', 'active'].includes(status) && hasRunningFixedTermAccess(existing)) {
       return res.json({ updated: false, reason: 'fixed_term_access_running' });
     }
 
@@ -522,10 +525,10 @@ router.post('/update-entitlement', requireMakeSecret, async (req, res) => {
     if (trialEndsAt) updatePayload.trial_ends_at = trialEndsAt;
 
     // Garde-fou : un statut inactif ne retire pas l'accès si le client a encore
-    // un autre abonnement app actif ou en essai (hors La Transmission), relu chez
+    // un autre abonnement app actif, en essai ou en retard de paiement (hors La Transmission), relu chez
     // Stripe. L'entitlement bascule alors sur cet abonnement.
     let keptSubscriptionId = null;
-    if (!ACTIVE_LIKE_STATUSES.includes(status)) {
+    if (!PREMIUM_STATUSES.includes(status)) {
       const subscriptions = await stripe.subscriptions.list({ customer: stripeCustomerId, status: 'all', limit: 100 });
       const stillActive = pickRelevantAppSub(subscriptions.data);
       if (stillActive) {
@@ -547,7 +550,7 @@ router.post('/update-entitlement', requireMakeSecret, async (req, res) => {
     if (error) throw error;
 
     if (existing?.supabase_user_id) {
-      const isPremium = ACTIVE_LIKE_STATUSES.includes(updatePayload.status);
+      const isPremium = PREMIUM_STATUSES.includes(updatePayload.status);
       await syncAiQuotaPremium(existing.supabase_user_id, isPremium);
     }
 
@@ -590,8 +593,10 @@ router.get('/entitlement-status/:supabaseUserId', requireUser, async (req, res) 
     if (error && error.code !== 'PGRST116') throw error;
 
     res.json({
-      active: ACTIVE_LIKE_STATUSES.includes(data?.status),
+      active: PREMIUM_STATUSES.includes(data?.status),
       trialActive: data?.status === 'trialing',
+      // Retard de paiement : Premium gardé, l'app invite à mettre la carte à jour.
+      paymentIssue: data?.status === 'past_due',
       trialEndsAt: data?.trial_ends_at || null,
       planType: data?.plan_type || null,
       accessExpiresAt: data?.access_expires_at || null,
@@ -612,7 +617,7 @@ router.get('/programme-status', requireMakeSecret, async (req, res) => {
       .from('entitlements')
       .select('supabase_user_id')
       .eq('purchase_email', email.trim().toLowerCase())
-      .in('status', ACTIVE_LIKE_STATUSES)
+      .in('status', PREMIUM_STATUSES)
       .order('updated_at', { ascending: false })
       .limit(1);
 

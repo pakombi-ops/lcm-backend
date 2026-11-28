@@ -3,7 +3,7 @@
 // valeur lue n est encore celle de la base. Deux requêtes simultanées ne peuvent pas
 // consommer le même message. Aucune modification de base nécessaire.
 const FREE_LIMIT = 10;
-const ACTIVE_LIKE_STATUSES = ['trialing', 'active'];
+const { PREMIUM_STATUSES } = require('./billingStatus');
 const MAX_TRIES = 6;
 
 function createQuota(supabase, { freeLimit = FREE_LIMIT } = {}) {
@@ -14,7 +14,7 @@ function createQuota(supabase, { freeLimit = FREE_LIMIT } = {}) {
       .eq('supabase_user_id', userId)
       .maybeSingle();
     if (error) throw error;
-    if (!ACTIVE_LIKE_STATUSES.includes(data?.status)) return false;
+    if (!PREMIUM_STATUSES.includes(data?.status)) return false;
     // Accès à durée fixe (La Transmission) : une date de fin dépassée ne donne plus accès,
     // même si la tâche expire_fixed_term_access n'est pas encore passée.
     if (data.access_expires_at && new Date(data.access_expires_at) <= new Date()) return false;

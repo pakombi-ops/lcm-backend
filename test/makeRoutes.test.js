@@ -104,6 +104,23 @@ test('update-entitlement : ne retire pas un accès à durée fixe en cours (comp
   assert.equal(supabaseState.writes.length, 0);
 });
 
+test('update-entitlement : past_due d’un paiement en 3 fois ne touche pas un accès à durée fixe en cours', async (t) => {
+  resetSupabase({
+    tables: {
+      entitlements: [{
+        supabase_user_id: 'u1', stripe_customer_id: 'cus_1', status: 'active',
+        access_expires_at: new Date(Date.now() + 86400000).toISOString(),
+      }],
+    },
+  });
+  const ctx = await start();
+  t.after(ctx.close);
+  const res = await postJson(`${ctx.baseUrl}/api/update-entitlement`, { stripeCustomerId: 'cus_1', status: 'past_due' }, MAKE);
+  assert.deepEqual(await res.json(), { updated: false, reason: 'fixed_term_access_running' });
+  assert.equal(supabaseState.tables.entitlements[0].status, 'active');
+  assert.equal(supabaseState.writes.length, 0);
+});
+
 // ------------------------------------------------------------ provision-account : email du client Stripe
 
 test('provision-account : provisionne quand l’email correspond au client Stripe (casse et espaces ignorés)', async (t) => {
