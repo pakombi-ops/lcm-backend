@@ -578,6 +578,14 @@ router.post('/update-entitlement', requireMakeSecret, async (req, res) => {
   }
 });
 
+// Statuts d'un abonnement qui engage encore des paiements (mêmes que routes/billingPortal.js).
+const SUBSCRIPTION_RUNNING_STATUSES = ['trialing', 'active', 'past_due', 'unpaid', 'paused', 'incomplete'];
+function hasManageableSubscription(row) {
+  return typeof row?.stripe_customer_id === 'string'
+    && row.stripe_customer_id.startsWith('cus_')
+    && SUBSCRIPTION_RUNNING_STATUSES.includes(row?.status);
+}
+
 // GET /api/entitlement-status/:supabaseUserId
 router.get('/entitlement-status/:supabaseUserId', requireUser, async (req, res) => {
   if (req.params.supabaseUserId !== req.user.id) {
@@ -586,7 +594,7 @@ router.get('/entitlement-status/:supabaseUserId', requireUser, async (req, res) 
   try {
     const { data, error } = await supabase
       .from('entitlements')
-      .select('status, plan_type, trial_ends_at, access_expires_at')
+      .select('status, plan_type, trial_ends_at, access_expires_at, stripe_customer_id')
       .eq('supabase_user_id', req.params.supabaseUserId)
       .single();
 
@@ -600,6 +608,9 @@ router.get('/entitlement-status/:supabaseUserId', requireUser, async (req, res) 
       trialEndsAt: data?.trial_ends_at || null,
       planType: data?.plan_type || null,
       accessExpiresAt: data?.access_expires_at || null,
+      // Abonnement Stripe en cours : l'app n'affiche « Gérer mon abonnement » que dans ce cas
+      // (pas pour un accès offert ou le fondateur, sans client Stripe).
+      hasSubscription: hasManageableSubscription(data),
     });
   } catch (err) {
     console.error('Erreur entitlement-status:', err.message);
@@ -657,3 +668,4 @@ module.exports = router;
 module.exports.STRIPE_SUBSCRIPTION_STATUSES = STRIPE_SUBSCRIPTION_STATUSES;
 module.exports.normalizeEmail = normalizeEmail;
 module.exports.firstNameFrom = firstNameFrom;
+module.exports.hasManageableSubscription = hasManageableSubscription;

@@ -103,6 +103,7 @@ function resetStripe({ customers = [], subscriptions = {} } = {}) {
   stripeState.customers = customers;
   stripeState.subscriptions = subscriptions;
   stripeState.calls = [];
+  stripeState.portalError = null;
 }
 
 const fakeStripe = {
@@ -120,6 +121,15 @@ const fakeStripe = {
     async list(params) {
       stripeState.calls.push({ fn: 'customers.list', params });
       return { data: stripeState.customers.filter((c) => c.email === params.email).slice(0, params.limit || 10) };
+    },
+  },
+  billingPortal: {
+    sessions: {
+      async create(params) {
+        stripeState.calls.push({ fn: 'billingPortal.sessions.create', params });
+        if (stripeState.portalError) throw stripeState.portalError;
+        return { url: `https://billing.stripe.test/session/${params.customer}` };
+      },
     },
   },
   subscriptions: {

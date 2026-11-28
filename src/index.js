@@ -11,6 +11,7 @@ const { createQuota } = require('./quota');
 const { validateChatBody } = require('./chatValidation');
 const { createClient } = require('@supabase/supabase-js');
 const entitlementsRoutes = require('../routes/entitlements');
+const billingPortalRoutes = require('../routes/billingPortal');
 
 const app = express();
 app.set('trust proxy', 1); // Railway : IP réelle pour le rate limiting
@@ -53,6 +54,7 @@ app.options('*', cors()); // Gère les pre-flight requests mobiles
 // 64 Ko suffisent largement : message ≤ 2000 caractères + 20 messages d'historique.
 app.use(express.json({ limit: '64kb' }));
 app.use('/api', entitlementsRoutes);
+app.use('/api', billingPortalRoutes);
 
 // Rate limiting
 // 1) par IP, AVANT la vérification du jeton : limite aussi les appels sans compte.
